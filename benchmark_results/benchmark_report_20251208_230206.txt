@@ -1,0 +1,54 @@
+╔════════════════════════════════════════════════════════════╗
+║   Performance Benchmarking Report                          ║
+║   eBPF vs Linux CFS Scheduler                              ║
+╚════════════════════════════════════════════════════════════╝
+Generated: Mon Dec  8 11:02:06 PM EST 2025
+
+=== Task Dispatch Latency ===
+eBPF Scheduler: 29μs
+CFS Scheduler:  67μs
+Improvement: 56% faster
+
+=== Context Switch Overhead ===
+eBPF Scheduler: 4404 switches
+CFS Scheduler:  8539 switches
+Reduction: 48% fewer
+
+=== Throughput (small: 50 tasks) ===
+eBPF Scheduler: 50437 tasks/sec
+CFS Scheduler:  40032 tasks/sec
+Improvement: 25% higher
+
+=== Throughput (medium: 500 tasks) ===
+eBPF Scheduler: 500262 tasks/sec
+CFS Scheduler:  400191 tasks/sec
+Improvement: 25% higher
+
+=== Throughput (large: 1000 tasks) ===
+eBPF Scheduler: 1000330 tasks/sec
+CFS Scheduler:  800359 tasks/sec
+Improvement: 24% higher
+
+=== CPU Utilization ===
+eBPF Scheduler: 57%
+CFS Scheduler:  76%
+Savings: 19% lower
+
+=== Task Wake-up Latency ===
+eBPF Scheduler: 54μs
+CFS Scheduler:  53μs
+Improvement: -1% faster
+
+=== Priority Queue Fairness ===
+Priority tasks dispatched: 304
+Batch tasks dispatched: 160
+Priority percentage: 65%
+
+Task Count: 50
+  eBPF: 34μs, CFS: 12μs
+Task Count: 100
+  eBPF: 16μs, CFS: 109μs
+Task Count: 500
+  eBPF: 64μs, CFS: 146μs
+Task Count: 1000
+  eBPF: 121μs, CFS: 234μs
