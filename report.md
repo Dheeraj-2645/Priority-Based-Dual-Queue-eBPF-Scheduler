@@ -42,100 +42,51 @@ A simplified priority-based dual-queue scheduler using eBPF offers:
 ### 2.1 System Architecture
 
 ```mermaid
-graph TB
-    subgraph Kernel["Linux Kernel 6.14+ (sched_ext enabled)"]
-        direction TB
-        
-        subgraph eBPF["eBPF Scheduler Layer (scheduler.bpf.c)"]
-            Enqueue["enqueue() Hook<br/>Classify: Priority vs Batch<br/>Queue placement logic"]
-            Dispatch["dispatch() Hook<br/>Select next task<br/>Priority-first algorithm"]
-            Exit["exit_task() Hook<br/>Cleanup on termination<br/>PID removal"]
-        end
-        
-        subgraph Maps["BPF Maps (Kernel Data Structures)"]
-            PriorityMap["priority_pids_map<br/>Type: BPF_MAP_TYPE_HASH<br/>Max: 10,000 entries<br/>O(1) operations"]
-            StatsMap["queue_stats<br/>Type: BPF_MAP_TYPE_PERCPU_ARRAY<br/>Per-CPU counters<br/>No lock overhead"]
-        end
-        
-        Enqueue -.->|lookup PID| PriorityMap
-        Dispatch -.->|select from queue| PriorityMap
-        Exit -.->|remove PID| PriorityMap
-        Enqueue -.->|update counter| StatsMap
-        Dispatch -.->|update counter| StatsMap
-    end
-    
-    subgraph UserSpace["User Space (loader.c)"]
-        CLI["CLI Tool<br/>Command Parser<br/>getopt() interface"]
-        Operations["Map Operations<br/>add_pid() -a<br/>remove_pid() -r<br/>list_pids() -l<br/>get_stats() -s"]
-        LoaderMain["Main Loader Function<br/>BPF object loading<br/>Program attachment<br/>RLIMIT_MEMLOCK mgmt"]
-    end
-    
-    subgraph libbpf["libbpf Library (User-space API)"]
-        Loading["bpf_object__open()<br/>bpf_object__load()<br/>bpf_map__fd()"]
-        Attachment["bpf_link__open_struct_ops()<br/>struct_ops registration<br/>Scheduler installation"]
-        Maps2["bpf_map__lookup_elem()<br/>bpf_map__update_elem()<br/>bpf_map__delete_elem()"]
-    end
-    
-    Kernel -->|read/write maps| UserSpace
-    UserSpace -->|libbpf API| libbpf
-    libbpf -->|load & attach| Kernel
-    CLI --> Operations
-    Operations --> LoaderMain
-    LoaderMain -->|use| libbpf
-```
-
-### 2.1 High-Level Architecture
-
-```mermaid
-flowchart TB
-  subgraph Kernel["Linux Kernel 6.1+ (sched_ext enabled)"]
-    direction TB
-
-    subgraph EBPF["eBPF Scheduler Program (scheduler.bpf.c)"]
-      EBPFDesc["Kernel-space VM<br/>Executes in kernel context<br/>• No context switches needed<br/>• Direct memory access<br/>• Minimal overhead (sandboxed execution)"]
-    end
-
-    subgraph Maps["BPF Maps (Kernel Data Structures)"]
-      PriorityMap["1) priority_pids_map<br/>Type: BPF_MAP_TYPE_HASH<br/>• Stores PIDs of high-priority tasks<br/>• 10,000 maximum entries<br/>• O(1) lookup/insert/delete"]
-      StatsMap["2) queue_stats<br/>Type: BPF_MAP_TYPE_PERCPU_ARRAY<br/>• Per-CPU statistics counters<br/>• Enqueue/dispatch counts by queue type"]
-    end
-
-    EBPFDesc <--> PriorityMap
-    EBPFDesc <--> StatsMap
+flowchart LR
+  subgraph User["User space"]
+    Loader["loader.c (CLI/loader)"]
+    Admin["Admin actions<br/>add/remove/list priority PIDs<br/>read stats"]
+    Loader --> Admin
   end
 
-  subgraph User["User Space (loader.c)"]
-    Loader["BPF Program Loader & Manager<br/>• Load/unload eBPF program<br/>• Manage priority_pids_map (-a, -r, -l)<br/>• Query statistics (-s)<br/>• CLI interface (getopt parsing)"]
+  subgraph KernelSpace["Kernel space (sched_ext)"]
+    SchedExt["sched_ext (kernel interface)"]
+    Events["Kernel scheduling events<br/>task runnable / CPU needs task / task exit"]
+    Enq["hook: enqueue()"]
+    Dis["hook: dispatch()"]
+    Exit["hook: exit_task()"]
+    subgraph Maps["BPF maps"]
+      PMap["priority_pids_map<br/>(PID to priority membership)"]
+      SMap["queue_stats<br/>(enqueue/dispatch counters)"]
+    end
+    Decision["Scheduling decision<br/>priority-first, else batch"]
+
+    SchedExt --> Events
+    Events --> Enq
+    Events --> Dis
+    Events --> Exit
+
+    Enq -->|lookup PID| PMap
+    Enq -->|update counters| SMap
+    Enq --> Decision
+
+    Dis -->|consume next task| Decision
+    Dis -->|update counters| SMap
+
+    Exit -->|delete PID| PMap
   end
 
-  Loader -->|libbpf| Kernel
-  Kernel -->|BPF maps| Loader
+  Admin -->|libbpf: update/lookup| PMap
+  Admin -->|libbpf: read| SMap
+  Loader -->|libbpf: load + attach| SchedExt
 ```
+
 
 ### 2.2 Scheduler Loading & Override Mechanism
 
 #### 2.2.1 How the Scheduler Overrides the Default CFS
 
 The Linux kernel supports multiple scheduler classes registered in a priority-ordered list. The sched_ext framework adds a new scheduler class that can be enabled to override the default CFS scheduler.
-
-**Scheduler Class Hierarchy** (in priority order):
-
-```mermaid
-graph TD
-    A["sched_ext Class<br/>(Our Custom eBPF)<br/>← ACTIVE when loaded"] 
-    B["CFS Scheduler Class<br/>(Default Linux)<br/>← Fallback when disabled"]
-    C["Real-Time Scheduler<br/>(RT Priority)<br/>← System processes"]
-    D["Idle Scheduler<br/>(Idle threads)<br/>← CPU at rest"]
-    
-    A --> B
-    B --> C
-    C --> D
-    
-    style A fill:#90EE90
-    style B fill:#FFE6CC
-    style C fill:#E6E6FA
-    style D fill:#D3D3D3
-```
 
 When our eBPF scheduler is loaded, the kernel's sched_ext hook points to our eBPF program for all scheduling decisions, effectively bypassing the CFS scheduler.
 
@@ -153,30 +104,15 @@ clang -O2 -target bpf \
 **Step 2: User-Space Loader Execution**
 
 ```c
-// loader.c execution flow
-int main(int argc, char *argv[]) {
-    // Step 2.1: Increase locked memory limit
-    struct rlimit rlim_new = {
-        .rlim_cur = RLIM_INFINITY,
-        .rlim_max = RLIM_INFINITY,
-    };
-    setrlimit(RLIMIT_MEMLOCK, &rlim_new);  // Allow unlimited kernel memory
-    
-    // Step 2.2: Load the BPF object file
-    struct bpf_object *obj = bpf_object__open("scheduler.bpf.o");
-    
-    // Step 2.3: Verify eBPF bytecode
-    bpf_object__load(obj);  // Kernel verifier checks program safety
-    
-    // Step 2.4: Get references to BPF maps
-    bpf_map__fd(bpf_object__find_map_by_name(obj, "priority_pids_map"));
-    bpf_map__fd(bpf_object__find_map_by_name(obj, "queue_stats"));
-    
-    // Step 2.5: Register scheduler with kernel
-    bpf_link__open_struct_ops(obj);  // Install as sched_ext scheduler
-    
-    return 0;
-}
+// loader.c (trimmed): load BPF object + get map fds (see src/loader.c for full CLI)
+if (bump_memlock_rlimit()) return 1;                // allow BPF maps/programs to be pinned in memlock
+obj = bpf_object__open(obj_file);                   // open compiled BPF object from argv
+if (libbpf_get_error(obj)) return 1;                // abort if open failed
+if (bpf_object__load(obj)) goto cleanup;            // verifier runs here
+priority_pids_map = bpf_object__find_map_by_name(obj, "priority_pids_map"); // map handle
+stats_map = bpf_object__find_map_by_name(obj, "queue_stats");              // map handle
+map_fd = bpf_map__fd(priority_pids_map);            // fd used for update/delete/list
+stats_fd = bpf_map__fd(stats_map);                  // fd used for stats reads
 ```
 
 #### 2.2.3 Key Libraries & System Calls
@@ -208,55 +144,19 @@ libbpf is the userspace library for interacting with eBPF programs. It provides:
 | `setrlimit()` | loader.c | Increase RLIMIT_MEMLOCK |
 | `sysfs write` | kernel | Enable/disable scheduler |
 
-#### 2.2.4 eBPF Verifier - Safety Mechanism
-
-When the eBPF program is loaded, the kernel's eBPF verifier performs static analysis:
-
-```mermaid
-graph TD
-    A["eBPF Bytecode Loaded"] -->|BPF_PROG_LOAD syscall| B["Kernel Verifier Runs"]
-    B --> C{"Valid Instructions?"}
-    C -->|No| D["❌ REJECT"]
-    C -->|Yes| E{"Memory Access Safe?"}
-    E -->|No| D
-    E -->|Yes| F{"Unbounded Loops?"}
-    F -->|Yes| D
-    F -->|No| G{"Stack Valid?"}
-    G -->|No| D
-    G -->|Yes| H{"Register Bounds OK?"}
-    H -->|No| D
-    H -->|Yes| I["✅ ACCEPT<br/>Program Loaded<br/>Ready to Attach"]
-    style I fill:#90EE90
-    style D fill:#FFB6C6
-```
-
-Our eBPF scheduler passes all verification checks because:
-- Uses only approved helper functions (`bpf_map_lookup_elem`, `scx_bpf_dispatch`)
-- Accesses only BPF maps (not arbitrary kernel memory)
-- No unbounded loops (loop unrolling used)
-- Stack usage is minimal (< 512 bytes)
-- All memory accesses are bounds-checked
-
-#### 2.2.5 How Override Works
+#### 2.2.4 How Override Works
 
 **Kernel Integration via sched_ext Framework:**
 
 1. **Framework Registration**
    ```c
-   // In scheduler.bpf.c
-   SEC("struct_ops/init")
-   int BPF_PROG(init)
-   {
-       // Called once during activation
-       return 0;
-   }
-   
-   SEC("struct_ops")
-   struct sched_ext_ops test_ops = {
-       .enqueue = (void *)enqueue,      // Override enqueue hook
-       .dispatch = (void *)dispatch,    // Override dispatch hook
-       .exit_task = (void *)exit_task,  // Override exit hook
-       .name = "ebpf_scheduler",        // Name of scheduler
+   // In src/scheduler.bpf.c (trimmed): declare sched_ext ops and hook entry points
+   SEC("struct_ops/sched_ext")
+   struct sched_ext_ops scheduler_ops = {
+       .enqueue = enqueue,              // called when a task becomes runnable
+       .dispatch = dispatch,            // called when CPU needs a task
+       .exit_task = exit_task,          // called when task exits (cleanup)
+       .name = "priority_scheduler",
    };
    ```
 
@@ -282,7 +182,7 @@ Our eBPF scheduler passes all verification checks because:
        D -->|Makes decisions| E
    ```
 
-#### 2.2.6 Runtime Modification Without Kernel Recompilation
+#### 2.2.5 Runtime Modification Without Kernel Recompilation
 
 The major advantage of our approach:
 
@@ -349,23 +249,20 @@ When task completes or exits:
 
 ```mermaid
 flowchart LR
-  subgraph P["PRIORITY QUEUE (Priority PIDs)"]
-    direction TB
-    P1["Tasks managed via<br/>priority_pids_map"]
-    P2["Examples:<br/>• Audio processing (PID 42)<br/>• Text editor (PID 51)<br/>• Game engine (PID 99)"]
-    P3["Dispatch Rate: ~63%<br/>Latency Goal: < 100μs"]
-  end
+  Map["priority_pids_map"]
+  Enq["enqueue(): classify task"]
+  PQ["Priority queue"]
+  BQ["Batch queue"]
+  Dis["dispatch(): pick next task"]
+  CPU["CPU runs task"]
 
-  subgraph B["BATCH QUEUE (Regular PIDs)"]
-    direction TB
-    B1["Default CFS scheduling<br/>Fair share allocation"]
-    B2["Examples:<br/>• Background jobs<br/>• Bulk data processing<br/>• Idle processes"]
-    B3["Dispatch Rate: ~37%<br/>Latency Goal: < 1ms"]
-  end
+  Enq -->|lookup PID| Map
+  Enq -->|if in map| PQ
+  Enq -->|else| BQ
 
-  CPU["CPU needs next task"]
-  CPU -->|"Priority selection strategy"| P
-  P -->|"If empty"| B
+  Dis -->|prefer| PQ
+  Dis -->|if empty| BQ
+  Dis --> CPU
 ```
 
 ### 2.4 Performance Characteristics
@@ -509,272 +406,50 @@ This component is the critical connection between user-space and kernel eBPF pro
 
 **Load Scheduler - Complete Flow**
 ```c
-#include <bpf/bpf.h>
-#include <bpf/libbpf.h>
-
-int main(int argc, char *argv[]) {
-    // STEP 1: Increase locked memory limit
-    // eBPF programs and maps are locked in kernel memory
-    struct rlimit rlim_new = {
-        .rlim_cur = RLIM_INFINITY,
-        .rlim_max = RLIM_INFINITY,
-    };
-    if (setrlimit(RLIMIT_MEMLOCK, &rlim_new)) {
-        perror("setrlimit failed");
-        return 1;
-    }
-    printf("✓ Increased RLIMIT_MEMLOCK to unlimited\n");
-    
-    // STEP 2: Open and parse the compiled eBPF object
-    struct bpf_object *obj = bpf_object__open("build/scheduler.bpf.o");
-    if (libbpf_get_error(obj)) {
-        fprintf(stderr, "Failed to open BPF object\n");
-        return 1;
-    }
-    printf("✓ Opened scheduler.bpf.o\n");
-    
-    // STEP 3: Load eBPF program into kernel
-    // This triggers the kernel's eBPF verifier
-    if (bpf_object__load(obj)) {
-        fprintf(stderr, "Failed to load BPF object: %s\n", 
-                strerror(errno));
-        return 1;
-    }
-    printf("✓ Loaded eBPF programs (passed verifier)\n");
-    
-    // STEP 4: Get file descriptors for BPF maps
-    // Maps are how user-space and kernel eBPF communicate
-    map_fd_priority = bpf_map__fd(
-        bpf_object__find_map_by_name(obj, "priority_pids_map")
-    );
-    map_fd_stats = bpf_map__fd(
-        bpf_object__find_map_by_name(obj, "queue_stats")
-    );
-    
-    if (map_fd_priority < 0 || map_fd_stats < 0) {
-        fprintf(stderr, "Failed to find BPF maps\n");
-        return 1;
-    }
-    printf("✓ Located BPF maps (priority_pids_map, queue_stats)\n");
-    
-    // STEP 5: Attach scheduler to kernel (the override happens here!)
-    struct bpf_link *link = bpf_link__open_struct_ops(obj);
-    if (libbpf_get_error(link)) {
-        fprintf(stderr, "Failed to attach scheduler: %s\n",
-                strerror(errno));
-        return 1;
-    }
-    printf("✓ Attached scheduler to kernel (sched_ext active)\n");
-    printf("✓ Custom eBPF scheduler is now ACTIVE\n");
-    printf("✓ CFS scheduler has been overridden\n");
-    
-    return 0;
-}
+// loader.c (trimmed): open + load object, then access the two maps by name
+if (bump_memlock_rlimit()) return 1;                       // raises RLIMIT_MEMLOCK
+obj = bpf_object__open(obj_file);                          // open BPF .o path from argv
+if (libbpf_get_error(obj)) return 1;                       // open failed
+if (bpf_object__load(obj)) goto cleanup;                   // verifier + load into kernel
+priority_pids_map = bpf_object__find_map_by_name(obj, "priority_pids_map"); // PID membership
+stats_map = bpf_object__find_map_by_name(obj, "queue_stats");              // counters
+map_fd = bpf_map__fd(priority_pids_map);                   // used for add/remove/list
+stats_fd = bpf_map__fd(stats_map);                         // used for stats reads
 ```
 
 **Map Operations**
 ```c
-// ADD PID to priority queue (-a option)
-int add_pid_to_priority(u32 pid) {
-    u32 priority_level = 1;  // All priorities same in our design
-    
-    // BPF map syscall: BPF_MAP_UPDATE_ELEM
-    if (bpf_map_update_elem(map_fd_priority, &pid, &priority_level, 0)) {
-        perror("bpf_map_update_elem");
-        return -1;
-    }
-    
-    printf("✓ Added PID %u to priority queue\n", pid);
-    return 0;
+// Add PID: priority_pids_map[pid] = 1
+__u32 priority_val = 1;                                    // mark membership
+bpf_map_update_elem(map_fd, &add_pid, &priority_val, BPF_ANY); // add/update map entry
+
+// Remove PID: delete from priority_pids_map
+bpf_map_delete_elem(map_fd, &remove_pid);                  // ignore ENOENT in code
+
+// List PIDs: iterate with get_next_key + lookup value
+while (bpf_map_get_next_key(map_fd, &pid, &next_pid) == 0) { // enumerate map
+    bpf_map_lookup_elem(map_fd, &next_pid, &priority_val);   // fetch value
+    pid = next_pid;
 }
 
-// REMOVE PID from priority queue (-r option)
-int remove_pid_from_priority(u32 pid) {
-    // BPF map syscall: BPF_MAP_DELETE_ELEM
-    if (bpf_map_delete_elem(map_fd_priority, &pid)) {
-        perror("bpf_map_delete_elem");
-        return -1;
-    }
-    
-    printf("✓ Removed PID %u from priority queue\n", pid);
-    return 0;
-}
-
-// LIST all priority PIDs (-l option)
-int list_priority_pids() {
-    u32 *key = NULL;
-    u32 next_key;
-    
-    printf("Priority PIDs currently in priority queue:\n");
-    printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-    
-    int count = 0;
-    // BPF map syscall: BPF_MAP_GET_NEXT_KEY
-    while (bpf_map_get_next_key(map_fd_priority, key, &next_key) == 0) {
-        u32 *val = bpf_map_lookup_elem(map_fd_priority, &next_key);
-        if (val) {
-            printf("  PID: %u (priority=%u)\n", next_key, *val);
-            count++;
-        }
-        key = &next_key;
-    }
-    
-    printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-    printf("Total: %d priority PIDs\n", count);
-    return 0;
-}
-
-// SHOW STATISTICS (-s option)
-int show_statistics() {
-    printf("\n╔════════════════════════════════════╗\n");
-    printf("║  Scheduler Statistics               ║\n");
-    printf("╚════════════════════════════════════╝\n\n");
-    
-    // Query per-CPU array statistics
-    u32 keys[] = {0, 1, 2, 3};  // priority_enq, priority_dis, batch_enq, batch_dis
-    const char *names[] = {"Priority Enqueued", "Priority Dispatched", 
-                          "Batch Enqueued", "Batch Dispatched"};
-    
-    for (int i = 0; i < 4; i++) {
-        u64 *counters = bpf_map_lookup_elem(map_fd_stats, &keys[i]);
-        
-        if (counters) {
-            // Per-CPU array: need to sum across all CPUs
-            u64 total = 0;
-            // In real implementation, iterate through all CPUs
-            printf("%s: %lu\n", names[i], total);
-        }
-    }
-    
-    return 0;
-}
+// Read stats: queue_stats is per-cpu, so user space sums an array of per-cpu counters
+bpf_map_lookup_elem(stats_fd, &key, stats);                // stats[] holds per-cpu values
+for (int cpu = 0; cpu < 256; cpu++) total += stats[cpu];   // sum per-cpu counters
 ```
 
 #### Command-Line Interface
 ```c
-// Parse command-line arguments using getopt
-int main(int argc, char *argv[]) {
-    int opt;
-    u32 pid = 0;
-    
-    while ((opt = getopt(argc, argv, "a:r:lsh")) != -1) {
-        switch (opt) {
-            case 'a':  // Add PID to priority
-                pid = atoi(optarg);
-                load_scheduler();
-                add_pid_to_priority(pid);
-                break;
-                
-            case 'r':  // Remove PID from priority
-                pid = atoi(optarg);
-                load_scheduler();
-                remove_pid_from_priority(pid);
-                break;
-                
-            case 'l':  // List priority PIDs
-                load_scheduler();
-                list_priority_pids();
-                break;
-                
-            case 's':  // Show statistics
-                load_scheduler();
-                show_statistics();
-                break;
-                
-            case 'h':  // Help
-                print_help();
-                break;
-                
-            default:
-                fprintf(stderr, "Unknown option: %c\n", opt);
-                return 1;
-        }
-    }
-    
-    return 0;
+// loader.c parses flags with getopt_long() and then runs the selected operation(s)
+while ((opt = getopt_long(argc, argv, "a:r:lsh", options, &option_index)) != -1) {
+    if (opt == 'a') add_pid = atoi(optarg);                // -a/--add-pid
+    if (opt == 'r') remove_pid = atoi(optarg);             // -r/--remove-pid
+    if (opt == 'l') list_pids = 1;                          // -l/--list-pids
+    if (opt == 's') show_stats = 1;                         // -s/--stats
 }
 ```
 
-#### BPF Map Operations - System Call Details
 
-When operations like `bpf_map_update_elem()` are called, they translate to:
-
-```
-User-space Call:
-    bpf_map_update_elem(map_fd, &key, &value, flags)
-         ↓
-libbpf Library:
-    syscall(SYS_bpf, BPF_MAP_UPDATE_ELEM, &attr, sizeof(attr))
-         ↓
-Kernel:
-    bpf_map_update_elem() system call handler
-    ├─ Verify map ownership
-    ├─ Lock map (if needed)
-    ├─ Perform hash lookup/insert
-    ├─ Update counter
-    └─ Unlock map
-         ↓
-Return:
-    Result to user-space via syscall return value
-```
-
-**Performance Characteristics**:
-- Hash map operations: O(1) average case
-- No context switches needed (all in same syscall)
-- Minimal overhead compared to other IPC methods
-
-### 3.3 Build System (Makefile)
-
-The Makefile orchestrates the compilation pipeline:
-
-```makefile
-# 1. VMLINUX.H GENERATION
-# Extracts kernel type definitions from kernel BTF
-build/vmlinux.h:
-    bpftool btf dump file /sys/kernel/btf/vmlinux format c > build/vmlinux.h
-    # Creates: C header with all kernel types used by eBPF
-    # Size: ~100 KB of C definitions
-    # Used by: eBPF program for kernel data structure definitions
-
-# 2. EBPF PROGRAM COMPILATION
-# Compiles to eBPF bytecode
-build/scheduler.bpf.o: src/scheduler.bpf.c build/vmlinux.h
-    clang -O2 -target bpf \
-        -c src/scheduler.bpf.c -o build/scheduler.bpf.o
-    # Flags explained:
-    # -O2: Optimize for performance
-    # -target bpf: Compile to eBPF VM (not native)
-    # Result: 120 KB ELF object file with eBPF bytecode
-
-# 3. USER-SPACE COMPILATION
-# Compiles loader program
-build/bin/loader: src/loader.c
-    gcc -O2 -I/usr/include/bpf \
-        -L/usr/lib/x86_64-linux-gnu \
-        src/loader.c -o build/bin/loader \
-        -lbpf -lelf -lz
-    # Libraries linked:
-    # -lbpf: libbpf (BPF user-space API)
-    # -lelf: libelf (ELF format parsing)
-    # -lz: zlib (compression support)
-
-# 4. CLEAN
-clean:
-    rm -rf build/
-    # Remove all artifacts
-```
-
-Key compilation commands explained:
-
-| Tool | Command | Purpose |
-|------|---------|---------|
-| **bpftool** | `bpftool btf dump` | Extract kernel types for eBPF |
-| **clang** | `clang -target bpf` | Compile to eBPF bytecode |
-| **gcc** | `gcc -lbpf` | Compile user-space loader |
-
----
-
-## 3.4 User-Space to Kernel Communication (IPC Mechanism)
+## 3.3 User-Space to Kernel Communication
 
 To make this an experiment about *behavior*, we needed a control surface that could be changed at runtime without rebuilding the kernel or even restarting a long-running daemon. In our design, that control surface is **BPF Maps**.
 
@@ -784,34 +459,6 @@ The data flow between the user-space loader and the kernel eBPF scheduler happen
 - immediately observe how enqueue/dispatch behavior shifts under load,
 - keep the fast path in-kernel, while keeping policy knobs in user space.
 
-### Communication Architecture
-
-```mermaid
-graph LR
-    UserCLI["User-Space CLI<br/>(loader.c)"]
-    
-    UserLib["libbpf Library<br/>bpf_map_*_elem"]
-    
-    Syscall["bpf() Syscall<br/>BPF_MAP_*"]
-    
-    KernelBPF["Kernel eBPF VM<br/>(scheduler.bpf.c)"]
-    
-    BPFMap["BPF Map<br/>(priority_pids_map)<br/>in kernel memory"]
-    
-    Scheduler["Scheduling Decisions<br/>enqueue/dispatch"]
-    
-    UserCLI -->|#1 Add PID 1234| UserLib
-    UserLib -->|#2 syscall| Syscall
-    Syscall -->|#3 update| BPFMap
-    BPFMap -->|#4 lookup on next enqueue| KernelBPF
-    KernelBPF -->|#5 O1 check| Scheduler
-    
-    UserCLI -->|#6 Query stats| UserLib
-    UserLib -->|#7 syscall| Syscall
-    Syscall -->|#8 read| BPFMap
-    Syscall -->|#9 return to user| UserLib
-    UserLib -->|#10 display| UserCLI
-```
 
 ### Data Flow Example: Adding a High-Priority Task
 
@@ -842,7 +489,7 @@ sequenceDiagram
   libbpf-->>CLI: success
   CLI-->>User: prints "Added PID 1234 to priority queue"
 
-  Note over Sched,Map: Next time PID 1234 enqueues:\nlookup_elem(priority_pids_map, 1234) => found\nclassify as PRIORITY and dispatch accordingly
+  Note over Sched,Map: Next time PID 1234 enqueues:\n lookup_elem(priority_pids_map, 1234) => found\nclassify as PRIORITY and dispatch accordingly
 ```
 
 ### BPF Map as Communication Channel
@@ -851,99 +498,7 @@ BPF maps act as a **safe, high-performance control plane** between user space an
 
 We chose maps over other IPC mechanisms (shared memory, sockets, pipes, netlink) because they are the **native mechanism intended for eBPF**, require no extra daemons or context-switch-heavy messaging, and integrate cleanly with sched_ext. Other IPC options are either unsafe for kernel interaction (shared memory), or introduce higher overhead and operational complexity (sockets/pipes/netlink) relative to simple key-value policy/state updates.
 
-### Memory Layout in Kernel
-
-When `bpf_object__load()` is called:
-
-```
-Kernel Virtual Address Space:
-┌──────────────────────────────────────┐
-│ eBPF Program Code (120 KB)           │
-│ (scheduler.bpf.o bytecode)           │
-├──────────────────────────────────────┤
-│ priority_pids_map                    │
-│ (HASH MAP - 10,000 entries)          │
-│ ├─ Hash table metadata               │
-│ ├─ Hash buckets                      │
-│ ├─ Key-value pairs (32-bit keys)     │
-│ └─ Lock structures                   │
-├──────────────────────────────────────┤
-│ queue_stats                          │
-│ (PERCPU_ARRAY - Per-CPU counters)    │
-│ ├─ Counter 0 (priority_enq) x CPUs   │
-│ ├─ Counter 1 (priority_dis) x CPUs   │
-│ ├─ Counter 2 (batch_enq) x CPUs      │
-│ └─ Counter 3 (batch_dis) x CPUs      │
-├──────────────────────────────────────┤
-│ eBPF Runtime Metadata                │
-│ ├─ Program links                     │
-│ ├─ Attach points                     │
-│ └─ Verification info                 │
-└──────────────────────────────────────┘
-   All locked: mlock() called by kernel
-   Not swappable to disk
-```
-
-
-**Statistics Aggregation**
-```c
-// Aggregate per-CPU counters
-aggregate_stats()
-  - Sum per-CPU enqueue counts
-  - Sum per-CPU dispatch counts
-  - Calculate dispatch ratios
-  - Display formatted output
-```
-
-<!-- #### Command-Line Interface
-
-```
--a <PID>    Add PID to priority queue
--r <PID>    Remove PID from priority queue
--l          List all priority PIDs
--s          Show statistics
--h          Display help
-``` -->
-
-### 3.3 Build System (Makefile)
-
-#### Compilation Pipeline
-
-```mermaid
-graph LR
-    vmlinux["vmlinux.h<br/>(Kernel Types)"]
-    bpf["scheduler.bpf.c<br/>(eBPF Code)"]
-    headers["header files"]
-    clang["clang -target bpf<br/>(eBPF Compiler)"]
-    ebpfo["scheduler.bpf.o<br/>(120KB eBPF Object)"]
-    loader["loader.c<br/>(User-space)"]
-    libbpf["libbpf"]
-    gcc["gcc linking<br/>(User Compiler)"]
-    binary["bin/loader<br/>(50KB Binary)"]
-    
-    vmlinux --> clang
-    bpf --> clang
-    headers --> clang
-    clang --> ebpfo
-    
-    ebpfo --> gcc
-    loader --> gcc
-    libbpf --> gcc
-    gcc --> binary
-```
-<!-- 
-#### Key Make Targets
-
-```makefile
-vmlinux_btf       # Generate kernel type definitions
-scheduler         # Compile eBPF kernel module
-loader            # Compile user-space tool
-test              # Run all test suites
-clean             # Remove build artifacts
-``` -->
-
-
-## 3.5 Complete Runtime Flow: From Scheduler Load to Task Dispatch
+## 3.4 Complete Runtime Flow: From Scheduler Load to Task Dispatch
 
 This section traces the complete execution path to show exactly how the eBPF scheduler overrides CFS and controls task scheduling.
 
@@ -968,7 +523,7 @@ sequenceDiagram
     Libbpf->>Syscall: syscall(BPF_PROG_LOAD)
     Syscall->>Verifier: Pass bytecode for verification
     Verifier->>Verifier: Check safety
-    Verifier-->>Syscall: ✓ Pass
+    Verifier-->>Syscall: Pass
     Syscall->>Memory: Store eBPF bytecode
     Syscall-->>User: Return prog_fd
     
@@ -981,7 +536,7 @@ sequenceDiagram
     Libbpf->>Kernel: Register scheduler class
     Kernel->>Kernel: Install enqueue/dispatch hooks
     Kernel->>Kernel: Disable CFS for eBPF tasks
-    Kernel-->>User: ✓ Scheduler ACTIVE
+    Kernel-->>User: Scheduler ACTIVE
 ```
 
 ### Task Dispatch Phase (Continuously During Runtime)
@@ -1025,7 +580,7 @@ sequenceDiagram
     eBPF->>Task: scx_bpf_dispatch(task_1234, CPU)
     eBPF->>Stats: Update dispatch stats
     Stats-->>eBPF: queue_stats[PRIORITY_DIS]++
-    eBPF-->>CPU: Return: TASK DISPATCHED ✓
+    eBPF-->>CPU: Return: TASK DISPATCHED 
     CPU->>Task: Task now runs on CPU<br/>Executes user code<br/>Enjoys low latency
 ```
 
@@ -1089,35 +644,11 @@ graph LR
 - **Dispatch latency**: 54μs (vs 133μs CFS) → **59% faster**
 - **Context switches**: 2,375 (vs 3,749 CFS) → **36% fewer**
 - **CPU overhead**: 61% (vs 71% CFS) → **18% lower**
-- **User experience**: NOTICEABLY FASTER ✓
+- **User experience**: NOTICEABLY FASTER
 
 ---
 
 ## 4. Testing Strategy
-
-### 4.1 Test Hierarchy
-
-```mermaid
-graph TB
-    subgraph layer1["Layer 1: Performance Benchmarks"]
-        A["7 Tests<br/>Compare eBPF vs CFS<br/>Real workload simulation<br/>Scalability analysis"]
-    end
-    
-    subgraph layer2["Layer 2: Integration Tests"]
-        B["10 Tests<br/>End-to-end functionality<br/>Queue fairness<br/>Dynamic priority changes"]
-    end
-    
-    subgraph layer3["Layer 3: Unit Tests"]
-        C["10 Tests<br/>BPF map operations<br/>Data structure integrity<br/>Concurrency handling"]
-    end
-    
-    C --> B
-    B --> A
-    
-    style A fill:#E8F5E9
-    style B fill:#FFF9C4
-    style C fill:#F3E5F5
-```
 
 ### 4.1.1 Quick Benchmark Runner (benchmark_scheduler.sh)
 
@@ -1304,9 +835,9 @@ CFS slope:  0.13 μs/task (5.2x steeper)
 ```
 Task Type | Dispatches | Percentage | Status
 ----------|-----------|-----------|--------
-Priority  | 300+      | 63%       | ✅ Enforced
-Batch     | 200+      | 37%       | ✅ Fair share
-Ratio     | 1.7:1     | Priority | ✅ Working
+Priority  | 300+      | 63%       | Enforced
+Batch     | 200+      | 37%       | Fair share
+Ratio     | 1.7:1     | Priority | Working
 ```
 
 ---
@@ -1324,61 +855,8 @@ Ratio     | 1.7:1     | Priority | ✅ Working
 | Memory Usage (MB) | 52 | 72 | -20MB | 27.8% |
 | Wake-up Latency (μs) | 40 | 67 | -27μs | 40.3% |
 
-### 5.2 Graphs & Visualizations
 
-#### Dispatch Latency Comparison
-```
-Latency (μs)
-140 │                     ╱─
-    │                  ╱─
-120 │               ╱─
-    │            ╱─
-100 │         ╱─         CFS (O(n log n))
-    │      ╱─
- 80 │   ╱─
-    │╱─
- 60 │                   eBPF (O(1))
-    │
- 40 │      ───────────────────
-    │
- 20 │
-    └─────┬─────┬─────┬─────── Task Count
-        100    500   1000   5000
-```
-
-#### Context Switch Reduction
-```
-Context Switches (per 5s)
-4500 │  ▓▓▓▓▓ CFS
-     │  
-4000 │  ▓▓▓▓▓
-     │      
-3500 │  ▓▓▓▓▓
-     │
-3000 │  
-     │  ░░░░░ eBPF
-2500 │  ░░░░░
-     │
-2000 │  
-     │
-1500 │
-     └─────────────────────────────
-```
-
-#### CPU Utilization
-```
-CPU Usage (%)
-80 │  ▓▓▓▓▓ CFS (71%)
-   │  ▓▓▓▓▓
-60 │  ░░░░░ eBPF (57%)
-   │  ░░░░░
-40 │
-   │
-20 │
-   └──────────────────────────
-```
-
-### 5.3 Workload-Specific Results
+### 5.2 Workload-Specific Results
 
 #### Interactive Workload (Real-Time Audio/Video)
 - **Dispatch Latency**: 65% improvement (40μs eBPF vs 117μs CFS)
@@ -1419,7 +897,7 @@ CPU Usage (%)
 **Decision**: Two simple queues instead of complex multi-level priority
 
 **Rationale**
-- Simpler implementation (119 lines of eBPF code)
+- Simpler implementation
 - O(1) dispatch time
 - Clear semantics (priority vs batch)
 - Easier to reason about and debug
@@ -1469,207 +947,6 @@ CPU Usage (%)
 4. Integration with perf tracepoints
 
 ---
-<!-- 
-## 7. Deployment Considerations
-
-### 7.1 System Requirements
-
-**Minimum**
-- Linux Kernel 6.1+ with CONFIG_SCHED_EXT=y
-- LLVM/Clang 12+
-- libbpf 0.5+
-- 256MB RAM, any CPU
-
-**Recommended**
-- Linux Kernel 6.5+ (latest eBPF features)
-- LLVM/Clang 16+ (better optimization)
-- libbpf 1.0+ (stable API)
-- Multi-core system for best scalability -->
-
-<!-- ### 7.2 Build & Deployment
-
-**Development Environment**
-```bash
-git clone <project-repo>
-cd project
-make clean && make all
-./bin/loader  # Start scheduler
-
-# Or run tests
-make test  # All tests pass
-```
-
-**Production Deployment**
-```bash
-# Build on development machine
-make RELEASE=1
-strip build/bin/loader  # Reduce size
-
-# Deploy binary + startup script
-scp build/bin/loader <target>:/usr/local/bin/
-scp scripts/start_scheduler.sh <target>:/etc/init.d/
-``` -->
-
-<!-- ### 7.2 Security Considerations
-
-**eBPF Verifier Safety**
-- All eBPF code is verified before execution
-- Cannot access arbitrary kernel memory
-- Sandboxed execution environment
-- No direct security risk from eBPF
-
-**Access Control**
-- Requires root (CAP_SYS_ADMIN) to modify priority list
-- Statistics can be read by any user
-- Use restrictive file permissions on management socket -->
-
-<!-- ### 7.4 Monitoring & Debugging
-
-**View Statistics**
-```bash
-sudo ./build/bin/loader -s
-# Shows: enqueue/dispatch counts, per-CPU breakdown
-```
-
-**Monitor Scheduling**
-```bash
-# Using standard Linux tools
-watch -n 1 'cat /proc/stat | grep ctxt'  # Context switches
-top -p <PID>  # CPU time for specific process
-```
-
-**Trace Execution**
-```bash
-# eBPF introspection
-sudo bpftool map dump name priority_pids_map  # View priority PIDs
-sudo bpftool map dump name queue_stats        # View statistics
-```
-
---- -->
-<!-- 
-## 8. Comparison with Alternative Approaches
-
-### 8.1 vs. CFS Scheduler
-
-| Aspect | eBPF | CFS |
-|--------|------|-----|
-| Dispatch Time | O(1) | O(log n) |
-| Complexity | 119 lines | 10K+ lines |
-| Priority Support | Explicit | Via nice/rt_priority |
-| Fairness | Simple 50/50 | Complex weighted |
-| Learning Curve | Low | High |
-| Production Hardening | Moderate | Extensive |
-| NUMA Support | No | Yes |
-
-### 8.2 vs. RT Scheduler
-
-| Aspect | eBPF | RT |
-|--------|------|-----|
-| Priority Levels | 2 (priority/batch) | 100 (0-99) |
-| Response Time | < 50μs | < 10μs |
-| Determinism | Good | Excellent |
-| Load Balancing | Basic | Advanced |
-| Fair Share | Optional | Not available |
-| Admin Overhead | Low | Medium |
-
-### 8.3 vs. Custom Kernel Module
-
-| Aspect | eBPF | Kernel Module |
-|--------|------|------|
-| Development Time | 1-2 weeks | 4-8 weeks |
-| Safety | Sandboxed | Full kernel access |
-| Debugging | Easier | Complex |
-| Performance | Near-native | Native |
-| Deployment | Simple | Complex |
-| Recompilation | No kernel rebuild | Full rebuild needed |
-
----
-
-## 9. Testing Methodology
-
-### 9.1 Test Execution Matrix
-
-| Test Type | Count | Status | Lines of Code |
-|-----------|-------|--------|---|
-| Unit Tests | 10 | ✅ 10/10 Passing | 219 |
-| Integration Tests | 10 | ✅ 10/10 Passing | 279 |
-| Stress Tests | 10 | ✅ 10/10 Passing | 394 |
-| Performance Benchmarks | 7 | ✅ 7/7 Complete | 450+ |
-| **TOTAL** | **37** | **✅ ALL PASSING** | **1,342** |
-
-### 9.2 Test Environment
-
-**Hardware**
-- CPU: ARM64 processor
-- RAM: 8GB minimum
-- Disk: 1GB for build artifacts
-- Network: Not required
-
-**Software**
-- OS: Ubuntu 24.04 LTS
-- Kernel: 6.14.0-34-generic with sched_ext
-- Toolchain: clang 20.1.2, llvm 20.1.2
-- Libraries: libbpf 1.5.0, glibc 2.39
-
-### 9.3 Benchmark Methodology
-
-**Dispatch Latency Measurement**
-```
-1. Start 100-1000 concurrent tasks
-2. Measure time from enqueue system call to dispatch
-3. Record minimum, average, maximum
-4. Repeat 3 times, take median
-```
-
-**Context Switch Counting**
-```
-1. Run 500 concurrent tasks for 5 seconds
-2. Read /proc/stat ctxt counter before/after
-3. Calculate difference
-4. Repeat 3 times, average
-```
-
-**CPU Utilization Profiling**
-```
-1. Start workload on isolated CPU
-2. Sample /proc/stat at 100Hz
-3. Calculate % time in scheduler code
-4. Compare eBPF vs CFS
-```
-
----
-
-## 10. Lessons Learned & Recommendations
-
-### 10.1 Key Insights
-
-1. **Simple Often Better**: 119 lines of eBPF code beats 10K+ line CFS for latency
-2. **O(1) Matters**: Hash-based dispatch provides consistent performance
-3. **Per-CPU Reduces Contention**: Avoids lock overhead in statistics
-4. **Priority Useful**: Many workloads benefit from explicit priority
-5. **eBPF Practical**: Production-ready kernel extensions possible
-
-### 10.2 Recommendations
-
-**For Performance-Critical Applications**
-- Use this scheduler for latency-sensitive workloads
-- Mark real-time tasks as priority via `-a PID`
-- Monitor with provided statistics tool
-- Expected benefit: 40-65% latency reduction
-
-**For General Purpose Deployment**
-- Consider hybrid approach: eBPF for known hotspots
-- Fall back to CFS for flexibility/compatibility
-- Test thoroughly in target environment first
-
-**For Future Development**
-- Extend to multiple priority levels (0-255)
-- Integrate with cgroup v2 for container environments
-- Add NUMA-aware scheduling for multi-socket systems
-- Develop perf integration for detailed profiling
-
---- -->
-
 ## 7. Conclusion
 
 This project was an exploration of **using eBPF (via sched_ext) to modify Linux scheduling behavior for specific loads**, without rewriting or rebuilding the kernel. By keeping the policy deliberately small (dual-queue, priority-first) and using maps as a runtime control plane, we could observe measurable behavior changes under concurrency.
@@ -1683,57 +960,6 @@ By leveraging eBPF's in-kernel execution environment and sched_ext's flexible fr
 **Production-ready** with comprehensive testing  
 
 Overall, the project demonstrates that eBPF is a viable platform for *iterating on* and *deploying* targeted scheduling policies when the goal is predictable behavior for particular workloads (e.g., interactive/latency-sensitive tasks) rather than a fully general replacement for CFS.
-
-<!-- ### Recommendation
-
-**Status**: PRODUCTION READY
-
-The scheduler is suitable for deployment in:
-- Real-time audio/video systems
-- Interactive desktop environments
-- Latency-sensitive microservices
-- High-throughput server workloads
-- Embedded systems requiring responsive scheduling
-
----
-
-## Appendices
-
-### A. Build Output Example
-```
-$ make clean && make all
-[eBPF] scheduler.bpf.c → build/scheduler.bpf.o
-[VMLINUX] Generating build/vmlinux.h
-[CC] loader.c → build/bin/loader
-[SUCCESS] All targets built successfully
-  - build/scheduler.bpf.o (120 KB)
-  - build/bin/loader (50 KB)
-```
-
-### B. Test Execution Summary
-```
-Unit Tests: ✅ 10/10 PASS
-Integration Tests: ✅ 10/10 PASS
-Stress Tests: ✅ 10/10 PASS
-Performance Benchmarks: ✅ 7/7 COMPLETE
-
-Total: ✅ 37/37 TESTS PASSING (100% SUCCESS)
-```
-
-### C. Performance Benchmark Results
-```
-Dispatch Latency:
-  eBPF:  40μs (average across 50-1000 tasks)
-  CFS:   117μs
-  Improvement: 65%
-
-Context Switches:
-  eBPF:  2,720 per 5 seconds
-  CFS:   4,084 per 5 seconds
-  Reduction: 33%
-
-[See run_performance_tests.sh output for complete results]
-``` -->
 
 ## References
 
