@@ -25,7 +25,6 @@ struct {
 #define STAT_BATCH_DISPATCHED   3
 
 // Enqueue hook - called when task becomes runnable
-SEC("struct_ops/enqueue")
 void enqueue(struct task_struct *p, u64 enq_flags)
 {
     __u32 pid = p->pid;
@@ -49,7 +48,6 @@ void enqueue(struct task_struct *p, u64 enq_flags)
 }
 
 // Dispatch hook - decides which task to run
-SEC("struct_ops/dispatch")
 void dispatch(s32 cpu, struct task_struct *prev)
 {
     // In this simple implementation, we let the kernel's default scheduling handle dispatch
@@ -61,7 +59,6 @@ void dispatch(s32 cpu, struct task_struct *prev)
 }
 
 // Exit task hook - cleanup when task exits
-SEC("struct_ops/exit_task")
 void exit_task(struct task_struct *p, struct scx_exit_task_args *args)
 {
     __u32 pid = p->pid;

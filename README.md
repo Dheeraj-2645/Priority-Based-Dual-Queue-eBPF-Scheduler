@@ -26,10 +26,20 @@ This project implements a priority-based dual-queue scheduler for the Linux kern
 ### Prerequisites
 
 **Minimum Requirements:**
-- Linux Kernel 6.1+ with `CONFIG_SCHED_EXT=y`
+- Linux Kernel 6.1+ with `CONFIG_SCHED_EXT=y` (or `CONFIG_SCHED_CLASS_EXT=y` on newer kernels)
 - LLVM/Clang 12+
 - libbpf 0.5+
 - GCC for compilation
+
+**Verify Kernel Support:**
+```bash
+# Check for CONFIG_SCHED_EXT or CONFIG_SCHED_CLASS_EXT
+grep -E "CONFIG_SCHED_EXT|CONFIG_SCHED_CLASS_EXT" /boot/config-$(uname -r)
+# Expected output: CONFIG_SCHED_CLASS_EXT=y (or CONFIG_SCHED_EXT=y on older kernels)
+
+# Verify kernel version
+uname -r  # Should be 6.1 or newer
+```
 
 **Ubuntu/Debian Setup:**
 ```bash
@@ -37,16 +47,11 @@ sudo apt update
 sudo apt install -y \
     build-essential clang llvm libelf-dev libz-dev \
     libbpf-dev bpftool linux-headers-$(uname -r)
-
-# Verify sched_ext support
-zcat /boot/config-$(uname -r) | grep CONFIG_SCHED_EXT
-# Expected: CONFIG_SCHED_EXT=y
 ```
 
 ### Build
 
 ```bash
-cd ~/cse597-os/project
 make clean
 make
 
@@ -58,11 +63,11 @@ ls -lh build/bin/loader build/scheduler.bpf.o
 
 ```bash
 # Load the custom scheduler
-sudo ./build/bin/loader
+sudo ./build/bin/loader build/scheduler.bpf.o
 
 # Verify it's running
-sudo ./build/bin/loader -l  # List priority tasks
-sudo ./build/bin/loader -s  # Show statistics
+sudo ./build/bin/loader -l build/scheduler.bpf.o  # List priority tasks
+sudo ./build/bin/loader -s build/scheduler.bpf.o  # Show statistics
 ```
 
 ### Run Performance Tests
@@ -106,7 +111,7 @@ Runs stress scenarios (load spikes, hotplug/memory-pressure simulations) to sani
 
 ```bash
 # Make a high-priority task
-sudo ./build/bin/loader -a 1234
+sudo ./build/bin/loader -a 1234 build/scheduler.bpf.o
 
 # Task PID 1234 will now get preferential scheduling
 ```
@@ -114,80 +119,70 @@ sudo ./build/bin/loader -a 1234
 ### Remove Task from Priority Queue
 
 ```bash
-sudo ./build/bin/loader -r 1234
+sudo ./build/bin/loader -r 1234 build/scheduler.bpf.o
 ```
 
 ### View Priority Tasks
 
 ```bash
-sudo ./build/bin/loader -l
+sudo ./build/bin/loader -l build/scheduler.bpf.o
 
 # Output:
-# Priority PIDs (10000 entries max):
-# Found PIDs: 1234, 5678, 9012
+# PIDs in priority queue:
+#   PID: 1234 (priority: 1)
+#   PID: 5678 (priority: 1)
+#   PID: 9012 (priority: 1)
 ```
 
 ### View Scheduler Statistics
 
 ```bash
-sudo ./build/bin/loader -s
+sudo ./build/bin/loader -s build/scheduler.bpf.o
 
 # Output:
-# Scheduler Statistics:
-# Priority Enqueued: 45,234
-# Priority Dispatched: 44,892
-# Batch Enqueued: 32,145
-# Batch Dispatched: 31,987
-# Per-CPU breakdown: ...
+# Queue Statistics:
+#   Priority Enqueued: 45234
+#   Batch Enqueued: 32145
+#   Priority Dispatched: 44892
+#   Batch Dispatched: 31987
 ```
 
 
 ## Build System
 
+The project uses a simple Makefile that compiles:
+- **scheduler.bpf.o**: The eBPF kernel-space scheduler program
+- **loader**: The user-space application to load and manage the scheduler
+
 ### Clean Build
 ```bash
 make clean
-make all
-```
-
-### Rebuild Only Kernel Component
-```bash
-make clean_scheduler
-make scheduler
-```
-
-### Rebuild Only User-Space
-```bash
-make clean_loader
-make loader
+make
 ```
 
 ## Usage
 
 ### Basic Commands
 
-**Load the scheduler:**
+The `loader` binary takes the eBPF object file as its last positional argument:
+
 ```bash
+# Load the scheduler and display help
+sudo ./build/bin/loader -h build/scheduler.bpf.o
+
+# Load the scheduler
 sudo ./build/bin/loader build/scheduler.bpf.o
-```
 
-**Add a PID to the priority queue:**
-```bash
+# Add a PID to the priority queue
 sudo ./build/bin/loader -a <PID> build/scheduler.bpf.o
-```
 
-**Remove a PID from the priority queue:**
-```bash
+# Remove a PID from the priority queue
 sudo ./build/bin/loader -r <PID> build/scheduler.bpf.o
-```
 
-**List all PIDs in the priority queue:**
-```bash
+# List all PIDs in the priority queue
 sudo ./build/bin/loader -l build/scheduler.bpf.o
-```
 
-**Display queue statistics:**
-```bash
+# Display queue statistics
 sudo ./build/bin/loader -s build/scheduler.bpf.o
 ```
 
@@ -195,13 +190,13 @@ sudo ./build/bin/loader -s build/scheduler.bpf.o
 
 ```bash
 # Build the project
-make all
+make clean && make
 
-# Load the scheduler (in one terminal)
+# Load the scheduler
 sudo ./build/bin/loader build/scheduler.bpf.o
 
 # In another terminal, add some PIDs to the priority queue
-SOME_PID=1234
+SOME_PID=$$  # Current shell PID
 sudo ./build/bin/loader -a $SOME_PID build/scheduler.bpf.o
 
 # List priority tasks
@@ -209,26 +204,50 @@ sudo ./build/bin/loader -l build/scheduler.bpf.o
 
 # View statistics
 sudo ./build/bin/loader -s build/scheduler.bpf.o
+
+# Remove from priority queue
+sudo ./build/bin/loader -r $SOME_PID build/scheduler.bpf.o
 ```
 
 
 ## Testing
 
+### Automated Testing
+
+Run the automated benchmark suite:
+
+```bash
+# Quick benchmark (results saved to benchmark_results/)
+./benchmark_scheduler.sh
+
+# Comprehensive performance tests
+./run_performance_tests.sh
+
+# Stress tests for stability verification
+./test_scheduler_stress.sh
+```
+
 ### Manual Testing
 
 1. **Build verification:**
    ```bash
-   make clean && make all
+   make clean && make
+   ls -lh build/bin/loader build/scheduler.bpf.o
    ```
 
 2. **Loader execution:**
    ```bash
-   sudo ./build/bin/loader build/scheduler.bpf.o -h
+   sudo ./build/bin/loader -h build/scheduler.bpf.o
    ```
 
-3. **Map operations (if loaded):**
+3. **Basic functionality test:**
    ```bash
-   # These commands will work when the scheduler is active
+   # Load the scheduler
+   sudo ./build/bin/loader build/scheduler.bpf.o
+   
+   # Add current shell to priority queue
    sudo ./build/bin/loader -a $$ build/scheduler.bpf.o
-   sudo ./build/bin/loader -l build/scheduler.bpf.o
+   
+   # View statistics
+   sudo ./build/bin/loader -s build/scheduler.bpf.o
    ```
